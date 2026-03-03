@@ -766,6 +766,106 @@ function ct_table(s::TPSCIstate; ne_cluster=10, nroots=1)
     end
 end
 
+"""
+    general_ct_analysis(s::TPSCIstate; ne_ref=nothing, thresh=1e-5, nroots=1)
+
+General CT analysis allowing different electron counts per cluster.
+`ne_ref` is a Vector{Int} with the reference total electrons (α+β) in each cluster.
+If `ne_ref === nothing`, it is taken from the reference Fock space of `s`.
+"""
+function general_ct_analysis(s::TPSCIstate; ne_ref=nothing, thresh=1e-5, nroots=1)
+    # Build reference total-electron counts per cluster if not provided
+    if ne_ref === nothing
+        # take the first Fock sector as reference
+        first_fock = first(keys(s.data))
+        ne_ref = [sum(first_fock[c]) for c in 1:length(s.clusters)]
+    end
+
+    for root in 1:nroots
+        println()
+        @printf(" --------------------------------------------------\n")
+        @printf(" ----------- CHARGE TRANSFER ANALYSIS -------------\n")
+        @printf(" --------------------------------------------------\n")
+        @printf(" ----------                root ------:     = %5i  \n", root)
+        @printf(" --------------------------------------------------\n")
+        @printf(" Printing contributions greater than: %f\n", thresh)
+        @printf(" %-20s%-20s%-20s\n", "Weight", "# Configs", "Fock space(α,β)...")
+        @printf(" %-20s%-20s%-20s\n", "-------", "---------", "----------")
+
+        ct = 0.0
+        for (fock, configs) in s.data
+            # is this Fock sector charge-transfer relative to ne_ref?
+            is_ct = false
+            for c in 1:length(s.clusters)
+                if sum(fock[c]) != ne_ref[c]
+                    is_ct = true
+                    break
+                end
+            end
+
+            prob = 0.0
+            if is_ct
+                for (_, coeff) in configs
+                    prob += coeff[root] * coeff[root]
+                end
+                if prob > thresh
+                    @printf(" %-20.5f%-20i", prob, length(configs))
+                    for sector in fock
+                        @printf("(%2i,%-2i)", sector[1], sector[2])
+                    end
+                    println()
+                end
+            end
+            ct += prob
+        end
+
+        @printf(" --------------------------------------------------\n")
+        @printf(" %-10.5f %-10s\n", ct, "=   Total charge transfer weight")
+        @printf(" --------------------------------------------------\n")
+    end
+end
+
+"""
+    general_ct_table(s::TPSCIstate; ne_ref=nothing, nroots=1)
+
+Total CT weight per root, allowing different electrons per cluster.
+`ne_ref` is a Vector{Int} with reference total electrons (α+β) in each cluster.
+"""
+function general_ct_table(s::TPSCIstate; ne_ref=nothing, nroots=1)
+    if ne_ref === nothing
+        first_fock = first(keys(s.data))
+        ne_ref = [sum(first_fock[c]) for c in 1:length(s.clusters)]
+    end
+
+    @printf(" -----------------------\n")
+    @printf(" --- CHARGE TRANSFER ---\n")
+    @printf(" -----------------------\n")
+    @printf(" %-15s%-10s\n", "Root", "Total CT")
+    @printf(" %-15s%-10s\n", "-------", "---------")
+
+    for root in 1:nroots
+        ct = 0.0
+        for (fock, configs) in s.data
+            # CT if any cluster deviates from its reference electron count
+            is_ct = false
+            for c in 1:length(s.clusters)
+                if sum(fock[c]) != ne_ref[c]
+                    is_ct = true
+                    break
+                end
+            end
+
+            if is_ct
+                prob = 0.0
+                for (_, coeff) in configs
+                    prob += coeff[root] * coeff[root]
+                end
+                ct += prob
+            end
+        end
+        @printf(" %-15i%-10.5f\n", root, ct)
+    end
+end
 
 
 
