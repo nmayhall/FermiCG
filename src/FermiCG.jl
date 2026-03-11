@@ -84,6 +84,7 @@ include("tpsci.jl")
 
 include("dense_inner.jl")
 include("dense_outer.jl")
+include("spt_variance.jl")
 
 #
 #####################################

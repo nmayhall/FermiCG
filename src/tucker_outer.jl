@@ -719,6 +719,7 @@ function build_compressed_1st_order_state(ψ::BSTstate{T,N,R}, cluster_ops, clus
     max_number=nothing, 
     nbody=4, 
     prescreen=false,
+    compress_iter=false,
     compress_twice=true
     )  where {T,N,R}
 
@@ -803,9 +804,10 @@ function build_compressed_1st_order_state(ψ::BSTstate{T,N,R}, cluster_ops, clus
 
     # Reset BLAS num_threads
     BLAS.set_num_threads(blas_num_threads)
-
-    @printf(" Compressing final σ vector:\n")
-    σ = compress_iteratively(σ, thresh)
+    if compress_iter==true
+        @printf(" Compressing final σ vector:\n")
+        σ = compress_iteratively(σ, thresh)
+    end
     return σ
 
 end
