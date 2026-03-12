@@ -56,7 +56,19 @@ function _sigma_block_norm2(term_list::Vector{NTuple{4,Any}},
     end
 
     # Combine into a single σ_block for this FOIS block
-    σ_block = nonorth_add(tucks)  # Tucker{T,N,R}
+    σ_block = try
+        # first try default SVD path
+        nonorth_add(tucks)  # Tucker{T,N,R}, svd_alg defaults to :default
+    catch e
+        if e isa LinearAlgebra.LAPACKException
+            @warn "nonorth_add (default SVD) failed; retrying with QRIteration" sig_fock sig_tconfig error=e
+            # retry with QR-based SVD
+            nonorth_add(tucks; svd_alg = :qr)
+        else
+            rethrow()
+        end
+    end
+
 
     # Compute local ⟨σ_block|σ_block⟩.
     #
@@ -167,7 +179,7 @@ Compute, in parallel, the FOIS approximation to ⟨X|H|0⟩⟨X|H|0⟩ for each 
 
 This uses the same FOIS definition as `compute_pt2_energy2`, but never stores a full σ.
 """
-function compute_spt_sigma_norm2_blockwise(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+function compute_spt_sigma_norm_blockwise(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
                                            H0          = "Hcmf",
                                            nbody       = 4,
                                            thresh_foi  = 1e-6,
@@ -252,6 +264,140 @@ function compute_spt_sigma_norm2_blockwise(ref::BSTstate{T,N,R}, cluster_ops, cl
 
             σ2_thread[tid] .+= _pt2_job_sigma_norm_blockwise(
                 fock_sig, job[2], ref_vec, cluster_ops, clustered_ham,
+                nbody, verbose, thresh_foi, max_number, prescreen
+            )
+
+            if verbose > 1 && jobi % tmp == 0
+                lock(lk)
+                try
+                    print("-"); nprinted += 1; flush(stdout)
+                finally
+                    unlock(lk)
+                end
+            end
+        end
+    end
+
+    flush(stdout)
+    verbose < 2 || for i in nprinted+1:100
+        print("-")
+    end
+    verbose < 2 || println("|")
+    flush(stdout)
+
+    @printf(" %-48s%10.1f s Allocated: %10.1e GB\n",
+            "Time spent computing σ·σ: ", t, alloc*1e-9)
+
+    σ2 = sum(σ2_thread)
+
+    for r in 1:R
+        @printf(" Root %3i: <σ|σ> = %14.8f\n", r, σ2[r])
+    end
+
+    return σ2
+end
+
+
+# --- Driver over all Fock sectors ------------------------------------------
+
+"""
+    compute_spt_sigma_norm_blockwise(ref::BSTstate, cluster_ops, clustered_ham;
+                                     H0="Hcmf", nbody=4, thresh_foi=1e-6,
+                                     max_number=nothing, opt_ref=true,
+                                     ci_tol=1e-6, verbose=1, prescreen=false)
+
+Compute, in parallel, the FOIS approximation to ⟨X|H|0⟩⟨X|H|0⟩ for each root:
+
+    σ2[r] ≈ ∑_X |<X|H|0_r>|^2
+
+This uses the same FOIS definition as `compute_pt2_energy2`, but never stores a full σ.
+"""
+function compute_spt_sigma_norm_blockwise_new(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+                                          H0          = "Hcmf",
+                                          nbody       = 4,
+                                          thresh_foi  = 1e-6,
+                                          max_number  = nothing,
+                                          opt_ref     = true,
+                                          ci_tol      = 1e-6,
+                                          verbose     = 1,
+                                          prescreen   = false) where {T,N,R}
+
+    println()
+    println(" |.......................BST-σ·σ (blockwise).....................................")
+    verbose < 1 || println(" H0          : ", H0          )
+    verbose < 1 || println(" nbody       : ", nbody       )
+    verbose < 1 || println(" thresh_foi  : ", thresh_foi  )
+    verbose < 1 || println(" max_number  : ", max_number  )
+    verbose < 1 || println(" opt_ref     : ", opt_ref     )
+    verbose < 1 || println(" ci_tol      : ", ci_tol      )
+    verbose < 1 || println(" verbose     : ", verbose     )
+    verbose < 1 || @printf("\n")
+    verbose < 1 || @printf(" %-50s", "Length of Reference: ")
+    verbose < 1 || @printf("%10i\n", length(ref))
+
+    lk = ReentrantLock()
+
+    # --- Solve variationally in reference space (same as compute_pt2_energy2) ---
+    ref_vec = deepcopy(ref)
+    clusters = ref_vec.clusters
+    E0 = zeros(T,R)
+
+    if opt_ref
+        @printf(" %-50s\n", "Solve zeroth-order problem: ")
+        time = @elapsed E0, ref_vec = ci_solve(ref_vec, cluster_ops, clustered_ham,
+                                               conv_thresh=ci_tol)
+        @printf(" %-50s%10.6f seconds\n", "Diagonalization time: ", time)
+    else
+        @printf(" %-50s", "Compute zeroth-order energy: ")
+        flush(stdout)
+        @time E0 = compute_expectation_value(ref_vec, cluster_ops, clustered_ham)
+    end
+
+    # --- Define jobs (same as compute_pt2_energy2) ---------------------------
+    jobs = Dict{FockConfig{N},Vector{Tuple}}()
+    for (fock_ket, configs_ket) in ref_vec.data
+        for (ftrans, terms) in clustered_ham
+            fock_x = ftrans + fock_ket
+
+            # Check Fock-sector validity
+            all(f[1] >= 0 for f in fock_x) || continue
+            all(f[2] >= 0 for f in fock_x) || continue
+            all(f[1] <= length(clusters[fi]) for (fi,f) in enumerate(fock_x)) || continue
+            all(f[2] <= length(clusters[fi]) for (fi,f) in enumerate(fock_x)) || continue
+
+            job_input = (terms, fock_ket, configs_ket)
+            if haskey(jobs, fock_x)
+                push!(jobs[fock_x], job_input)
+            else
+                jobs[fock_x] = [job_input]
+            end
+        end
+    end
+
+    jobs_vec = [(fock_x, job) for (fock_x, job) in jobs]
+
+    println(" Number of jobs:    ", length(jobs_vec))
+    println(" Number of threads: ", Threads.nthreads())
+    BLAS.set_num_threads(1)
+    flush(stdout)
+
+    # --- Thread-local accumulators for ⟨σ|σ⟩ -------------------------------
+    σ2_thread = [zeros(T,R) for _ in 1:Threads.nthreads()]
+
+    tmp = Int(round(length(jobs_vec) / 100))
+    tmp == 0 && (tmp = 1)
+    verbose < 2 || println(" |----------------------------------------------------------------------------------------------------|")
+    verbose < 2 || println(" |0%                                                                                              100%|")
+    verbose < 2 || print(" |")
+    nprinted = 0
+
+    alloc = @allocated t = @elapsed begin
+        @Threads.threads for jobi in eachindex(jobs_vec)
+            fock_sig, job = jobs_vec[jobi]
+            tid = Threads.threadid()
+
+            σ2_thread[tid] .+= _pt2_job_sigma_norm_blockwise(
+                fock_sig, job, ref_vec, cluster_ops, clustered_ham,
                 nbody, verbose, thresh_foi, max_number, prescreen
             )
 

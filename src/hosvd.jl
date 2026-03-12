@@ -73,14 +73,14 @@ function randomize!(t::Tucker{T,N,R}; seed=nothing) where {T,N,R}
 end
 
 """
-    add(tucks::Vector{Tucker{T,N}}; thresh=1e-10, max_number=nothing) where {T,N}
+    nonorth_add(tucks::Vector{Tucker{T,N}}; thresh=1e-10, max_number=nothing) where {T,N}
 
 Add together multiple Tucker instances. Assumed non-orthogonal.
 
 # Arguments
 - `tucks::Vector{Tucker{T,N}}`: Vector of Tucker objects
 """
-function nonorth_add(tucks::Vector{Tucker{T,N,R}}; thresh=1e-10, max_number=nothing, type="magnitude") where {T<:Number,N,R}
+function nonorth_add(tucks::Vector{Tucker{T,N,R}}; thresh=1e-10, max_number=nothing, type="magnitude",svd_alg::Symbol = :default) where {T<:Number,N,R}
     # sort the Tucker objects to add. This puts them in a well-defined order for reproducibility.
     norms = norm.(tucks)
     perm = sortperm(norms,rev=true)
@@ -104,7 +104,9 @@ function nonorth_add(tucks::Vector{Tucker{T,N,R}}; thresh=1e-10, max_number=noth
         end
         Ui = hcat(Ui...)
       
-        F = svd(Ui)
+        F = svd_alg === :qr  ? svd(Ui; alg = LinearAlgebra.QRIteration()) :
+            svd_alg === :default ? svd(Ui) :
+            error("unknown svd_alg = $svd_alg")
 
         nkeep = 0
         if type == "magnitude"
@@ -155,7 +157,7 @@ function nonorth_add(tucks::Vector{Tucker{T,N,R}}; thresh=1e-10, max_number=noth
 end
 
 
-function nonorth_add(tucks::Vector{Tucker{T,N,R}}, scr::Vector{Vector{T}}; thresh=1e-10, max_number=nothing, type="magnitude") where {T<:Number,N,R}
+function nonorth_add(tucks::Vector{Tucker{T,N,R}}, scr::Vector{Vector{T}}; thresh=1e-10, max_number=nothing, type="magnitude", svd_alg::Symbol = :default) where {T<:Number,N,R}
     # sort the Tucker objects to add. This puts them in a well-defined order for reproducibility.
     norms = norm.(tucks)
     perm = sortperm(norms,rev=true)
@@ -178,7 +180,9 @@ function nonorth_add(tucks::Vector{Tucker{T,N,R}}, scr::Vector{Vector{T}}; thres
         end
         Ui = hcat(Ui...)
       
-        F = svd(Ui)
+        F = svd_alg === :qr  ? svd(Ui; alg = LinearAlgebra.QRIteration()) :
+            svd_alg === :default ? svd(Ui) :
+            error("unknown svd_alg = $svd_alg")
 
         nkeep = 0
         if type == "magnitude"
