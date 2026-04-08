@@ -79,10 +79,11 @@ module TestVariance
         return e, v
     end
 
-    """Call both drivers and return (σ2_ref, σ2_fast)."""
-    function both_sigma2(v_var, cluster_ops, clustered_ham; thresh_foi=1e-8)
+    """Call both drivers and return (σ2_ref, σ2_fast).
+    opt_ref=false: wavefunction is already converged; skip the redundant CI solve."""
+    function both_sigma2(v_var, cluster_ops, clustered_ham; thresh_foi=1e-8, opt_ref=false)
         kwargs = (H0="Hcmf", nbody=4, thresh_foi=thresh_foi,
-                max_number=nothing, opt_ref=true, ci_tol=1e-6, verbose=0)
+                max_number=nothing, opt_ref=opt_ref, ci_tol=1e-6, verbose=0)
 
         σ2_ref  = FermiCG.compute_spt_sigma_norm_blockwise(
                     v_var, cluster_ops, clustered_ham; kwargs...)
@@ -90,7 +91,8 @@ module TestVariance
                     v_var, cluster_ops, clustered_ham; kwargs...)
         return σ2_ref, σ2_fast
     end
-    # Build the shared v_var at the coarsest threshold once for all agreement tests
+    # Build the shared v_var at the coarsest threshold once for all agreement tests.
+    # Also pre-compute σ2 once so the first three testsets don't repeat it 3×.
     let
         ints, clusters, cluster_ops, clustered_ham, d1, cluster_bases = load_fixture()
         _, vbst = build_seed(clusters, cluster_ops, clustered_ham, cluster_bases)
@@ -99,38 +101,35 @@ module TestVariance
                                     clustered_ham, cluster_bases, vbst)
                 e, v, cluster_ops, clustered_ham
             end
+        global _agree_σ2_ref, _agree_σ2_fast =
+            both_sigma2(_agree_v, _agree_cops, _agree_cham)
     end
 
     @testset "Agreement: σ² ref == fast (thresh=$(CIPSI_THRESHOLDS[1]))" begin
-        σ2_ref, σ2_fast = both_sigma2(_agree_v, _agree_cops, _agree_cham)
-
-        @test length(σ2_ref) == length(σ2_fast)
-        for r in eachindex(σ2_ref)
-            @testset "root $r mismatch" begin
-                @test isapprox(σ2_ref[r], σ2_fast[r]; rtol=1e-6, atol=1e-10)
+        @test length(_agree_σ2_ref) == length(_agree_σ2_fast)
+        for r in eachindex(_agree_σ2_ref)
+            @testset "root $r" begin
+                @test isapprox(_agree_σ2_ref[r], _agree_σ2_fast[r]; rtol=1e-6, atol=1e-10)
             end
         end
     end
 
     @testset "Agreement: variance-like quantity matches" begin
-        σ2_ref, σ2_fast = both_sigma2(_agree_v, _agree_cops, _agree_cham)
-
-        var_ref  = σ2_ref  .- _agree_e .^ 2
-        var_fast = σ2_fast .- _agree_e .^ 2
+        var_ref  = _agree_σ2_ref  .- _agree_e .^ 2
+        var_fast = _agree_σ2_fast .- _agree_e .^ 2
 
         for r in eachindex(var_ref)
-            @testset "root $r mismatch" begin
+            @testset "root $r" begin
                 @test isapprox(var_ref[r], var_fast[r]; rtol=1e-6, atol=1e-10)
             end
         end
     end
 
     @testset "Agreement: σ² values are non-negative" begin
-        σ2_ref, σ2_fast = both_sigma2(_agree_v, _agree_cops, _agree_cham)
-
-        for r in eachindex(σ2_ref)
-            @testset "root $r mismatch" begin
-                @test isapprox(σ2_ref[r], σ2_fast[r]; rtol=1e-6, atol=1e-10)
+        for r in eachindex(_agree_σ2_ref)
+            @testset "root $r" begin
+                @test _agree_σ2_ref[r]  >= 0
+                @test _agree_σ2_fast[r] >= 0
             end
         end
     end
@@ -192,6 +191,62 @@ module TestVariance
             end
         end
     end
+
+    # -------------------------------------------------------------------------
+    # Benchmark: compare reference vs fast (alternative) in alloc + time.
+    # Runs both twice: first call warms JIT, second call is measured.
+    # Gated behind SPT_BENCH=1 so it doesn't slow down CI by default.
+    # -------------------------------------------------------------------------
+    if get(ENV, "SPT_BENCH", "0") == "1"
+
+        @testset "Benchmark: fast vs reference alloc and time" begin
+            kwargs = (H0="Hcmf", nbody=4, thresh_foi=1e-8,
+                      max_number=nothing, opt_ref=false, ci_tol=1e-6, verbose=0)
+
+            # Warm up JIT
+            FermiCG.compute_spt_sigma_norm_blockwise(
+                _agree_v, _agree_cops, _agree_cham; kwargs...)
+            FermiCG.compute_spt_sigma_norm_blockwise_alternative(
+                _agree_v, _agree_cops, _agree_cham; kwargs...)
+
+            # Measure reference
+            alloc_ref = @allocated t_ref = @elapsed begin
+                σ2_ref = FermiCG.compute_spt_sigma_norm_blockwise(
+                    _agree_v, _agree_cops, _agree_cham; kwargs...)
+            end
+
+            # Measure fast
+            alloc_fast = @allocated t_fast = @elapsed begin
+                σ2_fast = FermiCG.compute_spt_sigma_norm_blockwise_alternative(
+                    _agree_v, _agree_cops, _agree_cham; kwargs...)
+            end
+
+            @printf("\n")
+            @printf(" %-45s  %10s  %12s\n", "Version", "Time (s)", "Alloc (GB)")
+            @printf(" %-45s  %10.3f  %12.4f\n",
+                    "compute_spt_sigma_norm_blockwise (ref)",
+                    t_ref, alloc_ref * 1e-9)
+            @printf(" %-45s  %10.3f  %12.4f\n",
+                    "compute_spt_sigma_norm_blockwise_alternative",
+                    t_fast, alloc_fast * 1e-9)
+            @printf(" %-45s  %10.2fx  %12.2fx\n",
+                    "Speedup / alloc reduction",
+                    t_ref / t_fast, alloc_ref / alloc_fast)
+            @printf("\n")
+
+            # Fast version must be at least as correct
+            for r in eachindex(σ2_ref)
+                @test isapprox(σ2_ref[r], σ2_fast[r]; rtol=1e-6, atol=1e-10)
+            end
+
+            # Soft assertion: fast should allocate less (report but don't fail)
+            if alloc_fast >= alloc_ref
+                @warn "fast version allocated MORE than reference" alloc_ref alloc_fast
+            end
+            @test alloc_fast <= alloc_ref * 1.05   # allow 5% tolerance
+        end
+
+    end # SPT_BENCH
 
     if get(ENV, "SPT_FULL", "0") == "1"
 

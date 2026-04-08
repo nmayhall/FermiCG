@@ -434,43 +434,6 @@ using FermiCG
 using LinearAlgebra
 using Printf
 
-# =============================================================================
-# OPTIMISATION OVERVIEW
-# =============================================================================
-#
-# Bottleneck 1 — BSTstate wrapper for norm:
-#   Original wraps σ_block in BSTstate + orth_dot.
-#   After nonorth_add, Tucker factors come from SVD → they ARE orthonormal.
-#   So ‖σ_r‖² = ‖core[r]‖² (plain dot with itself). No BSTstate needed.
-#
-# Bottleneck 2 — nonorth_add allocations:
-#   The scratch-buffer overload `nonorth_add(tucks, scr)` already exists in
-#   tucker.jl but was never called from the blockwise driver.
-#   We pre-allocate one `scr` per thread and reuse it across all blocks.
-#
-# Bottleneck 3 — typed contrib storage (NTuple{4,Any} → SigmaContrib):
-#   Any-typed tuples box every element on the heap. A concrete parametric
-#   struct lets the compiler keep everything unboxed.
-#
-# Bottleneck 4 — double check_term:
-#   Original calls check_term when building tconfigs_to_process AND again
-#   inside _sigma_block_norm2. We call it once and store only passing entries.
-#
-# Bottleneck 5 — Iterators.product allocation:
-#   Replaced with a mutating recursive helper that writes directly into the
-#   dict using a single reused scratch vector.
-#
-# Bottleneck 6 — per-block Tucker allocations in nonorth_add:
-#   The hcat of factor matrices is the unavoidable SVD kernel.
-#   We pre-size Ui buffers per mode once per block instead of re-hcating.
-#
-# Bottleneck 7 — lock in the progress counter hot path:
-#   Replaced with Threads.Atomic{Int} + lock only on the rare print call.
-#
-# =============================================================================
-
-# ---- Typed contribution record (avoids Any boxing) --------------------------
-
 struct SigmaContrib{T,N,R}
     term        :: Any                   # ClusteredTerm (opaque)
     ket_fock    :: FockConfig{N}
@@ -478,17 +441,20 @@ struct SigmaContrib{T,N,R}
     ket_tuck    :: Tucker{T,N,R}
 end
 
-# ---- Per-thread scratch buffers for nonorth_add -----------------------------
+struct BlockwiseScratch{T,N,R}
+    nonorth_scr :: Vector{Vector{T}}
+    tconfigs    :: Dict{TuckerConfig{N}, Vector{SigmaContrib{T,N,R}}}
+    tucks       :: Vector{Tucker{T,N,R}}
+    sig_vec     :: Vector{UnitRange{Int}}
+end
 
-"""
-    make_nonorth_scr(N, max_dim)
-
-Allocate the scratch buffer vector expected by the nonorth_add(tucks, scr) overload.
-`N` = number of Tucker modes, `max_dim` = largest expected uncompressed dimension.
-Returns `Vector{Vector{Float64}}` of length N, each pre-sized to `max_dim^N`.
-"""
-function make_nonorth_scr(N::Int, max_dim::Int=1024)
-    return [Vector{Float64}(undef, max_dim^N) for _ in 1:N]
+function make_blockwise_scratch(::Type{T}, ::Val{N}, ::Val{R}) where {T,N,R}
+    BlockwiseScratch{T,N,R}(
+        [Vector{T}(undef, 1) for _ in 1:N],
+        Dict{TuckerConfig{N}, Vector{SigmaContrib{T,N,R}}}(),
+        Tucker{T,N,R}[],
+        Vector{UnitRange{Int}}(undef, N),
+    )
 end
 
 # ---- Fast per-root norm² directly from Tucker cores ------------------------
@@ -529,6 +495,22 @@ function _tucker_norm2_nonorth(t::Tucker{T,N,R}) where {T,N,R}
     return nonorth_dot(t, t)
 end
 
+# Compute ‖core[r]‖² for each root assuming orthonormal factors — no check.
+# Called only from the K=1 path where form_sigma_block_expand guarantees
+# orthonormal factors (identity for active clusters, ket factors otherwise).
+@inline function _core_norm2_direct(t::Tucker{T,N,R}) where {T,N,R}
+    out = zeros(T, R)
+    @inbounds for r in 1:R
+        c = t.core[r]
+        s = zero(T)
+        @simd for i in eachindex(c)
+            s += c[i]*c[i]
+        end
+        out[r] = s
+    end
+    return out
+end
+
 # =============================================================================
 # _sigma_block_norm2_fast
 #
@@ -538,7 +520,7 @@ end
 #   - Passes pre-allocated scr to nonorth_add(tucks, scr) — no heap allocs
 #     inside the Tucker combination step
 #   - Computes ‖σ_block‖² directly from cores, no BSTstate wrapper
-#   - Single-contrib fast path skips nonorth_add entirely
+#   - Reuses buf.tucks across block calls (no Vector alloc)
 # =============================================================================
 
 function _sigma_block_norm2_fast(
@@ -548,11 +530,13 @@ function _sigma_block_norm2_fast(
         ket         :: BSTstate{T,N,R},
         cluster_ops,
         clustered_ham,
-        scr         :: Vector{Vector{T}};   # pre-allocated per-thread scratch
+        buf         :: BlockwiseScratch{T,N,R};
         thresh      :: T,
         max_number) where {T,N,R}
 
-    tucks = Tucker{T,N,R}[]
+    # Reuse pre-allocated tucks buffer (avoids Vector alloc per block call)
+    tucks = buf.tucks
+    empty!(tucks)
     sizehint!(tucks, length(contribs))
 
     @inbounds for contrib in contribs
@@ -565,33 +549,44 @@ function _sigma_block_norm2_fast(
 
         (length(sig_tuck) == 0 || norm(sig_tuck) < thresh) && continue
 
-        sig_tuck = compress(sig_tuck; thresh=thresh)
-        length(sig_tuck) == 0 && continue
-
+        # Do NOT compress yet: form_sigma_block_expand always returns orthonormal
+        # factors (active clusters → identity matrix, inactive → ket Tucker factors).
+        # For K=1 we can compute the norm directly without any SVD.
         push!(tucks, sig_tuck)
     end
 
     isempty(tucks) && return zeros(T, R)
 
-    # Combine Tucker contributions
-    σ_block = if length(tucks) == 1
-        # Fast path: skip nonorth_add (no SVD needed)
-        only(tucks)
-    else
-        try
-            # Use scratch-buffer overload to avoid heap allocs inside nonorth_add
-            nonorth_add(tucks, scr)
-        catch e
-            if e isa LinearAlgebra.LAPACKException
-                @warn "nonorth_add (scr) failed; retrying with QRIteration" sig_fock sig_tconfig
-                nonorth_add(tucks; svd_alg=:qr)   # safe fallback
-            else
-                rethrow()
-            end
+    # K=1 fast path: form_sigma_block_expand always returns orthonormal factors,
+    # so ‖σ_block‖²_r = ‖core[r]‖² with no SVD and no orthonormality check needed.
+    length(tucks) == 1 && return _core_norm2_direct(only(tucks))
+
+    # K>1: compress each contribution in-place to reduce the large identity-matrix
+    # factor ranks before the combining SVD in nonorth_add.
+    n_valid = 0
+    @inbounds for i in eachindex(tucks)
+        ct = compress(tucks[i]; thresh=thresh)
+        length(ct) == 0 && continue
+        n_valid += 1
+        tucks[n_valid] = ct
+    end
+    resize!(tucks, n_valid)
+
+    isempty(tucks) && return zeros(T, R)
+    # After compress, factors are orthonormal — safe to use direct core norm.
+    length(tucks) == 1 && return _core_norm2_direct(only(tucks))
+
+    σ_block = try
+        nonorth_add(tucks, buf.nonorth_scr)
+    catch e
+        if e isa LinearAlgebra.LAPACKException
+            @warn "nonorth_add (scr) failed; retrying with QRIteration" sig_fock sig_tconfig
+            nonorth_add(tucks; svd_alg=:qr)
+        else
+            rethrow()
         end
     end
 
-    # Compute ‖σ_block‖² per root directly from cores (no BSTstate!)
     return tucker_core_norm2(σ_block)
 end
 
@@ -612,11 +607,13 @@ function _pt2_job_sigma_norm_blockwise_fast(
         ket         :: BSTstate{T,N,R},
         cluster_ops,
         clustered_ham,
-        scr         :: Vector{Vector{T}},
+        buf         :: BlockwiseScratch{T,N,R},
         nbody, verbose, thresh, max_number, prescreen) where {T,N,R}
 
-    # Typed dict: TuckerConfig → list of pre-filtered contributions
-    tconfigs = Dict{TuckerConfig{N}, Vector{SigmaContrib{T,N,R}}}()
+    # Reuse pre-allocated Dict: empty! preserves the hash table allocation,
+    # avoiding the Dict() constructor cost (hash-array + metadata) every call.
+    tconfigs = buf.tconfigs
+    empty!(tconfigs)
 
     for jobi in job
         terms, ket_fock, ket_tconfigs = jobi
@@ -644,12 +641,10 @@ function _pt2_job_sigma_norm_blockwise_fast(
             skip_term && continue
 
             for (ket_tconfig, ket_tuck) in ket_tconfigs
-                # Mutable scratch for sig_tconfig construction.
-                # Must be Vector{UnitRange{Int}} because _fill_tconfigs! writes
-                # UnitRange{Int} subspace values into it — NOT plain Int.
-                sig_vec = collect(UnitRange{Int}, ket_tconfig.config)   # length N, mutable
+                # Reuse pre-allocated sig_vec: copyto! instead of collect(...)
+                copyto!(buf.sig_vec, ket_tconfig.config)
 
-                _fill_tconfigs!(tconfigs, sig_vec, available,
+                _fill_tconfigs!(tconfigs, buf.sig_vec, available,
                                 term, sig_fock, ket_fock, ket_tconfig, ket_tuck,
                                 1)
             end
@@ -661,7 +656,7 @@ function _pt2_job_sigma_norm_blockwise_fast(
     for (sig_tconfig, contribs) in tconfigs
         isempty(contribs) && continue
         n2 = _sigma_block_norm2_fast(contribs, sig_fock, sig_tconfig,
-                                     ket, cluster_ops, clustered_ham, scr;
+                                     ket, cluster_ops, clustered_ham, buf;
                                      thresh=thresh, max_number=max_number)
         σ2_job .+= n2
     end
@@ -738,7 +733,11 @@ Key speedups over the original:
   4. `check_term` called once per entry, not twice
   5. `_fill_tconfigs!`: in-place Cartesian product — no Iterators.product
   6. `Threads.Atomic` progress counter — no lock in the hot job loop
-  7. Per-thread scr buffers — no alloc contention across threads
+  7. `BlockwiseScratch` per thread: reuses Dict, Tucker buffer, sig_vec
+  8. Skip compress for K=1 blocks: `form_sigma_block_expand` always returns
+     orthonormal factors (active clusters → identity, inactive → ket factors),
+     so ‖σ_block‖² = ‖core[r]‖² with no SVD for the common single-contrib case.
+     For K>1, compress is still applied before `nonorth_add` to reduce rank.
 """
 function compute_spt_sigma_norm_blockwise_alternative(
         ref          :: BSTstate{T,N,R},
@@ -811,10 +810,12 @@ function compute_spt_sigma_norm_blockwise_alternative(
     BLAS.set_num_threads(1)
     flush(stdout)
 
-    # --- Per-thread scratch buffers for nonorth_add --------------------------
-    # Each Tucker mode needs one scratch vector.  We size conservatively;
-    # nonorth_add(tucks, scr) will resize!(scr[i], ...) as needed.
-    scr_per_thread = [make_nonorth_scr(N) for _ in 1:Threads.nthreads()]
+    # --- Per-thread scratch containers (Dict + tucks + nonorth_scr + sig_vec) --
+    # BlockwiseScratch holds all reusable buffers in one struct.
+    # nonorth_scr starts with 1-element vectors; add_transformed_tensor calls
+    # resize! as needed, so they warm up on the first job and stay warm.
+    buf_per_thread = [make_blockwise_scratch(T, Val(N), Val(R))
+                      for _ in 1:Threads.nthreads()]
 
     # --- Thread-local σ² accumulators + lock-free progress counter -----------
     σ2_thread   = [zeros(T, R) for _ in 1:Threads.nthreads()]
@@ -833,7 +834,7 @@ function compute_spt_sigma_norm_blockwise_alternative(
 
             σ2_thread[tid] .+= _pt2_job_sigma_norm_blockwise_fast(
                 fock_sig, job, ref_vec, cluster_ops, clustered_ham,
-                scr_per_thread[tid],
+                buf_per_thread[tid],
                 nbody, verbose, thresh_T, max_number, prescreen
             )
 
