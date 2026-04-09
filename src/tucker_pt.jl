@@ -1328,19 +1328,16 @@ function _pt2_job_blockwise(sig_fock, job, ket::BSTstate{T,N,R}, cluster_ops,
             length(sig_tuck) == 0 && continue
             norm(sig_tuck)   <  thresh && continue
 
-            sig_tuck_c = compress(sig_tuck; thresh=thresh)
-            length(sig_tuck_c) == 0 && continue
-
-            push!(tucks_H, sig_tuck_c)
+            push!(tucks_H, sig_tuck)
         end
 
         isempty(tucks_H) && continue
 
-        # -- 2b. Combine H Tucker blocks (collect-then-add — no iterative SVD) --
+        # -- 2b. Combine H Tucker blocks (collect-then-add — no iterative SVD).
+        #        No compression here: compressing <X|H|0> before the Tucker rotation
+        #        introduces truncation error in H that the reference (build_sigma!) avoids.
         curr_tuck_H = length(tucks_H) == 1 ? only(tucks_H) : nonorth_add(tucks_H)
         norm(curr_tuck_H) < thresh && continue
-        curr_tuck_H = compress(curr_tuck_H; thresh=thresh)
-        length(curr_tuck_H) == 0 && continue
 
         # -- 2c. Pseudo-canonical rotations V: diagonalise U'*F*U for each cluster.
         #        V_rot[ci.idx] is the ki×ki orthogonal rotation matrix.
