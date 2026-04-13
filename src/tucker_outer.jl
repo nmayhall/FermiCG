@@ -202,7 +202,7 @@ function ci_solve(ci_vector_in::BSTstate{T,N,R}, cluster_ops, clustered_ham;
     flush(stdout)
     tmp = deepcopy(vec)
     zero!(tmp)
-    @time build_sigma!(tmp, vec, cluster_ops, clustered_S2)
+    @time build_sigma_cepa!(tmp, vec, cluster_ops, clustered_S2)
     s2 = orth_dot(tmp,vec)
     flush(stdout)
     @printf(" %5s %12s %12s\n", "Root", "Energy", "S2") 
