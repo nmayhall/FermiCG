@@ -1051,3 +1051,311 @@ end
 #    return eval.(a)
 #end
 
+
+function do_fois_ci(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
+                    H0          = "Hcmf",
+                    max_iter    = 50,
+                    nbody       = 4,
+                    thresh_foi  = 1e-6,
+                    tol         = 1e-5,
+                    thresh_clip = 1e-6,
+                    threaded    =false,
+                    prescreen   = false,
+                    compress    = false,
+                    pt          =false,
+                    verbose     = true) where {T,N,R}
+    @printf("\n-------------------------------------------------------\n")
+    @printf(" Do CI in FOIS\n")
+    @printf("   H0                      = %-s\n", H0)
+    @printf("   thresh_foi              = %-8.1e\n", thresh_foi)
+    @printf("   nbody                   = %-i\n", nbody)
+    @printf("\n")
+    @printf("   Length of Reference     = %-i\n", length(ref))
+    @printf("\n-------------------------------------------------------\n")
+
+# 
+    # Solve variationally in reference space
+    ref_vec = deepcopy(ref)
+    @printf(" Solve zeroth-order problem. Dimension = %10i\n", length(ref_vec))
+    @time e0, ref_vec = tps_ci_direct(ref_vec, cluster_ops, clustered_ham, conv_thresh=tol)
+    
+
+    #
+    # Get First order wavefunction
+    println()
+    println(" Compute FOIS. Reference space dim = ", length(ref_vec))
+    # pt1_vec= deepcopy(ref_vec)
+    # pt1_vec=matvec(pt1_vec)
+    if threaded == true
+        pt1_vec = open_matvec_thread(ref_vec, cluster_ops, clustered_ham, nbody=nbody, thresh=thresh_foi, prescreen=prescreen)
+    else
+        pt1_vec = open_matvec_serial(ref_vec, cluster_ops, clustered_ham, nbody=nbody, thresh=thresh_foi, prescreen=prescreen)
+    end
+    for i in 1:R
+        @printf("Arnab: %12.8f\n", sqrt.(orth_dot(pt1_vec,pt1_vec))[i])
+    end
+    project_out!(pt1_vec, ref)
+    # Compress FOIS
+    if compress==true
+        norm1 = sqrt.(orth_dot(pt1_vec, pt1_vec))
+        dim1 = length(pt1_vec)
+        clip!(pt1_vec, thresh=thresh_clip) #does clip! function do the compression? or have to write a compress function.
+        norm2 = sqrt.(orth_dot(pt1_vec, pt1_vec))
+        dim2 = length(pt1_vec)
+        @printf(" %-50s%10i → %-10i (thresh = %8.1e)\n", "FOIS Compressed from: ", dim1, dim2, thresh_foi)
+        for i in 1:R
+            @printf(" %-50s%10.2e → %-10.2e (thresh = %8.1e)\n", "Norm of |1>: ",norm1[i], norm2[i], thresh_foi)
+        end
+    end
+    for i in 1:R
+        @printf(" %-50s%10.6f\n", "Overlap between <1|0>: ", overlap(pt1_vec, ref_vec)[i])
+    end
+
+    add!(ref_vec, pt1_vec)
+    # Solve for first order wavefunction 
+    println(" Compute CI energy in the space = ", length(ref_vec))
+   
+    eci, ref_vec = tps_ci_direct(ref_vec, cluster_ops, clustered_ham;)
+    for i in 1:R
+        @printf(" E(Ref)   for %ith state   = %12.8f\n",i, e0[i])
+        @printf(" E(CI) tot for %ith state = %12.8f\n",i, eci[i])
+    end
+    if pt==true
+        e_pt2,pt1_vec= compute_pt1_wavefunction(ref_vec, cluster_ops, clustered_ham;  H0=H0,verbose=verbose)  
+        for i in 1:R
+            @printf(" E(PT2)  for %ith state   = %12.8f\n",i, e_pt2[i])
+        end
+    end
+    return eci, ref_vec 
+    # println("debugging")
+    # error()
+end
+
+"""
+do_fois_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
+                    max_iter=20,
+                    cepa_shift="cepa",
+                    cepa_mit=30,
+                    nbody=4,
+                    thresh_foi=1e-6,
+                    thresh_clip=1e-5,
+                    tol=1e-8,
+                    compress=false,
+                    compress_type="matvec",
+                    verbose=1) where {T,N,R}
+
+Do CEPA in FOIS defined by ref and thresh_foi
+    -`ref`: reference state
+    -`cluster_ops`: cMF cluster operators
+    -`clustered_ham`: cMF clustered hamiltonian
+    -`cepa_shift`: type of CEPA calculation
+    -`cepa_mit`: maximum number of CEPA iterations
+    -`nbody`: number of cluster terms to include
+    -`thresh_foi`: threshold for first order interaction space
+    -`thresh_clip`: threshold for clipping
+    -`tol`: tolerance for convergence
+    -`compress`: compress the first order interaction space
+    -`compress_type`: type of compression
+    -`verbose`: verbosity level
+
+"""
+
+function do_fois_cepa(ref::TPSCIstate{T,N,R}, cluster_ops, clustered_ham;
+                        cepa_shift="cepa",
+                        cepa_mit=30,
+                        nbody=4,
+                        thresh_foi=1e-6,
+                        thresh_clip=1e-5,
+                        tol=1e-8,
+                        compress=false,
+                        compress_type="matvec",
+                        verbose=1) where {T,N,R}
+    @printf("\n-------------------------------------------------------\n")
+    @printf(" Do CEPA\n")
+    @printf("   thresh_foi              = %-8.1e\n", thresh_foi)
+    @printf("   nbody                   = %-i\n", nbody)
+    @printf("\n")
+    @printf("   Length of Reference     = %-i\n", length(ref))
+    @printf("   Calculation type        = %s\n", cepa_shift)
+    @printf("   Compression type        = %s\n", compress_type)
+    @printf("\n-------------------------------------------------------\n")
+
+    # 
+    # Solve variationally in reference space
+    println()
+    ref_vec = deepcopy(ref)
+    @printf(" Solve zeroth-order problem. Dimension = %10i\n", length(ref_vec))
+    @time e0, ref_vec = tps_ci_direct(ref_vec, cluster_ops, clustered_ham, conv_thresh=tol)
+
+    #
+     # Get First order wavefunction
+     println()
+     println(" Compute FOIS. Reference space dim = ", length(ref_vec))
+     pt1_vec = deepcopy(ref_vec)
+     pt1_vec=open_matvec_thread(pt1_vec, cluster_ops, clustered_ham, nbody=nbody, thresh=thresh_foi)
+     for i in 1:R
+         @printf("Arnab: %12.8f\n", sqrt.(orth_dot(pt1_vec, pt1_vec))[i])
+     end
+    project_out!(pt1_vec, ref)
+    # display(pt1_vec)
+
+    # Compress FOIS
+    if compress==true
+        norm1 = sqrt.(orth_dot(pt1_vec, pt1_vec))
+        dim1 = length(pt1_vec)
+        clip!(pt1_vec, thresh=thresh_clip)
+        norm2 = sqrt.(orth_dot(pt1_vec, pt1_vec))
+        dim2 = length(pt1_vec)
+        @printf(" %-50s%10i → %-10i (thresh = %8.1e)\n", "FOIS Compressed from: ", dim1, dim2, thresh_foi)
+        for i in 1:R
+            @printf(" %-50s%10.2e → %-10.2e (thresh = %8.1e)\n", "Norm of |1>: ",norm1[i], norm2[i], thresh_foi)
+        end
+    end
+    for i in 1:R
+        @printf(" %-50s%10.6f\n", "Overlap between <1|0>: ", overlap(pt1_vec, ref_vec)[i])
+    end
+    # 
+    
+    # Solve CEPA 
+    println()
+    cepa_vec = deepcopy(pt1_vec)
+    e_cepa_r=[]
+    println("Do CEPA: Dim = ", length(cepa_vec))
+    
+    # x_cepa=TPSCIstate(ref.clusters,T=T,R=R)
+    x_cepa = deepcopy(ref)
+    zero!(x_cepa)
+    for i in 1:R
+        @printf("CEPA for state %i\n", i)
+        # ref_vec_i=extract_chosen_root(ref_vec, i)
+        cepa_vec_i=extract_chosen_root(cepa_vec, i)
+        if verbose >=1 
+            display(cepa_vec_i)
+            # display(ref_vec_i)
+        end
+        println(" Do CEPA: Dim = ", length(cepa_vec_i))
+        # println("debugging")
+        # error()
+        @time e_cepa_corr,e_cepa  = tpsci_cepa_solve(ref_vec, cepa_vec_i, cluster_ops, clustered_ham, cepa_shift, cepa_mit, i=i,tol=tol,verbose=verbose)
+        
+        println(" E(cepa) for state $i   = ", e_cepa[1])
+        push!(e_cepa_r, e_cepa[1])
+        
+    end
+    for i in 1:R
+        @printf(" E(cepa)  =                 %12.8f\n", e_cepa_r[i])
+    end
+    
+    return e_cepa_r
+end
+
+
+"""
+    tpsci_cepa_solve(ref_vector::TPSCIstate, cepa_vector::TPSCIstate, cluster_ops, clustered_ham; tol=1e-5, cache=true)
+
+# Arguments
+- `ref_vector`: Input reference state. 
+- `cepa_vector`: TPSCIstate which defines the configurational space defining {X}. This 
+should be the first-order interacting space (or some compressed version of it).
+- `cluster_ops`
+- `clustered_ham`
+- `tol`: haven't yet set this up (NYI)
+- `cache`: Should we cache the compressed H operators? Speeds up drastically, but uses lots of memory
+
+Compute compressed CEPA.
+Since there can be non-zero overlap with a multireference state, we need to generalize.
+
+    HC = SCe
+
+    |Haa + Hax| |1 | = |I   + Sax| |1 | E
+    |Hxa + Hxx| |Cx|   |Sxa + I  | |Cx|
+
+    Haa + Hax*Cx = (1 + Sax*Cx)E
+    Hxa + HxxCx = SxaE + CxE
+
+The idea for CEPA is to approximate E in the amplitude equation.
+CEPA(0): E = Eref
+
+    (Hxx-Eref)*Cx = Sxa*Eref - Hxa
+
+Ax=b
+
+After solving, the Energy can be obtained as:
+    
+    E = (Eref + Hax*Cx) / (1 + Sax*Cx)
+"""
+
+function tpsci_cepa_solve(ref_vector::TPSCIstate{T,N,R}, cepa_vector::TPSCIstate, cluster_ops, clustered_ham, 
+                           cepa_shift="cepa", 
+                           cepa_mit = 50;
+                           i=1,
+                           tol=1e-5,
+                           verbose=0) where {T,N,R}
+    
+    
+    # H00=build_full_H(ref_vector, cluster_ops, clustered_ham)
+    # e0,v0=eigen(H00)
+    e0,v=FermiCG.tps_ci_direct(ref_vector, cluster_ops, clustered_ham, conv_thresh=tol)    
+    v0=extract_chosen_root(v, i)
+    if verbose >=1 
+        display(v0)
+    end
+    @printf("Reference Energy: %12.8f\n", e0[i])
+
+    Ec = 0.0
+    n_clusters = length(cepa_vector.clusters)
+    E=0.0
+    for it in 1:cepa_mit 
+
+    	if cepa_shift == "cepa"
+	        shift = 0.0
+	    elseif cepa_shift == "acpf"
+
+	        shift = Ec[1] * 2.0 / n_clusters
+	    elseif cepa_shift == "aqcc"
+	        shift = (1.0 - (n_clusters-3.0)*(n_clusters - 2.0)/(n_clusters * ( n_clusters-1.0) )) * Ec[1]
+            # println("shift = ",shift)
+	    elseif cepa_shift == "cisd"
+	        shift = Ec[1]
+	    else
+            println()
+            println("NYI: cepa_shift is not available:",cepa_shift)
+            println()
+            exit()
+	    end
+        Hdd=build_full_H(cepa_vector, cluster_ops, clustered_ham)
+        # display(size(Hdd))
+        Hdd=Hdd-(e0[i] + shift)*I(size(Hdd, 1))
+
+        # Hdd .+= -Matrix{eltype(Hdd)}(I(size(Hdd, 1))) * (e0[i] + shift)
+        H0d=build_full_H_parallel(v0,cepa_vector, cluster_ops, clustered_ham)
+        # display(size(H0d))
+
+        
+        Hd0 = H0d' 
+        Cd = Hdd \ -Hd0
+        Ec= Cd'*Hd0
+
+        println(" CEPA(0) Norm  : ", @sprintf("%16.12f", norm(Cd)))
+
+        println(" CEPA correlation Energy for iteration no $it: ", @sprintf("%16.12f", Ec[1]))
+
+        # Check for convergence
+        if abs(E[1] - e0[i] - Ec[1]) < tol
+            println("Converged")
+            @printf("Reference Energy: %12.8f\n", e0[i])
+            # display(E)
+            # display(Ec)
+            @printf("Total CEPA correlation = %18.12f\n", (Ec[1]))
+            @printf("CEPA Energy = %18.12f\n", (Ec[1]+e0[i]))
+
+
+            break
+        end
+        E = (Ec[1] + e0[i])
+    end
+    
+    return Ec[1] ,Ec[1]+e0[i]
+end
+
+

@@ -281,7 +281,6 @@ function _sum_pt2(sig_v, e2, Hd, E0, R)
     end
 end
 
-
 """
     compute_qdpt_energy2(ci_vector::TPSCIstate{T,N,R}, cluster_ops, clustered_ham::ClusteredOperator; 
         nbody=4, 
@@ -292,7 +291,6 @@ end
         threaded = true,
         verbose=1) where {T,N,R}
         this function computes the second-order energy correction using the Quasidegenerate perturbation theory
-        Approximation: Taking ∂E_S=0 in denominator of the perturbation theory expression
     args::
     TPSCIstate{T,N,R} : TPSCIstate object
     cluster_ops::Dict{Int64,Dict{String,Any}} : cluster operators
@@ -329,7 +327,6 @@ function compute_qdpt_energy(ci_vector_in::TPSCIstate{T,N,R}, cluster_ops, clust
         println(" Compute <0|H|0>:")
         E0 = compute_expectation_value_parallel(ci_vector, cluster_ops, clustered_ham)
     end
-
     if threaded == true
         @time sig = open_matvec_thread(ci_vector, cluster_ops, clustered_ham, nbody=nbody, thresh=thresh_foi, prescreen=prescreen)
     else
@@ -358,4 +355,6 @@ function compute_qdpt_energy(ci_vector_in::TPSCIstate{T,N,R}, cluster_ops, clust
         @printf(" %5s %12.8f %12.8f\n", r, E0[r], corrected_energies[r])
     end
     return corrected_energies
+
 end
+

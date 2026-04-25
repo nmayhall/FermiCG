@@ -202,7 +202,7 @@ function ci_solve(ci_vector_in::BSTstate{T,N,R}, cluster_ops, clustered_ham;
     flush(stdout)
     tmp = deepcopy(vec)
     zero!(tmp)
-    @time build_sigma!(tmp, vec, cluster_ops, clustered_S2)
+    @time build_sigma_cepa!(tmp, vec, cluster_ops, clustered_S2)
     s2 = orth_dot(tmp,vec)
     flush(stdout)
     @printf(" %5s %12s %12s\n", "Root", "Energy", "S2") 
@@ -258,7 +258,7 @@ After solving, the Energy can be obtained as:
 function tucker_cepa_solve(ref_vector::BSTstate{T,N,R}, cepa_vector::BSTstate, cluster_ops, clustered_ham, 
                            cepa_shift="cepa", 
                            cepa_mit  = 50; 
-                           tol       =1e-5, 
+                           tol       =1e-6, 
                            cache     =true, 
                            max_iter  =30, 
                            verbose   =false) where {T,N,R}
@@ -430,9 +430,9 @@ function tucker_cepa_solve(ref_vector::BSTstate{T,N,R}, cepa_vector::BSTstate, c
 
         @printf(" E(CEPA) = %18.12f\n", (e0[1] + ecorr[1])/(1+SxC[1]))
         Ecepa = (e0[1] + ecorr[1])/(1+SxC[1])
-        #@printf(" %s %18.12f\n",cepa_shift, (e0 + ecorr)/(1+SxC))
+        @printf(" %s %18.12f\n",cepa_shift, (e0[1] + ecorr[1])/(1+SxC[1]))
         @printf("Iter: %4d        %18.12f %18.12f \n",it,Ec ,Ecepa-e0)
-	    if abs(Ec - (Ecepa-e0)) < 1e-10
+	    if abs(Ec - (Ecepa-e0)) < 1e-15 
             @printf(" Converged %s %18.12f\n",cepa_shift, (e0[1] + ecorr[1])/(1+SxC[1]))
 	        break
 	    end
@@ -719,6 +719,7 @@ function build_compressed_1st_order_state(ψ::BSTstate{T,N,R}, cluster_ops, clus
     max_number=nothing, 
     nbody=4, 
     prescreen=false,
+    compress_iter=false,
     compress_twice=true
     )  where {T,N,R}
 
@@ -803,9 +804,10 @@ function build_compressed_1st_order_state(ψ::BSTstate{T,N,R}, cluster_ops, clus
 
     # Reset BLAS num_threads
     BLAS.set_num_threads(blas_num_threads)
-
-    @printf(" Compressing final σ vector:\n")
-    σ = compress_iteratively(σ, thresh)
+    if compress_iter==true
+        @printf(" Compressing final σ vector:\n")
+        σ = compress_iteratively(σ, thresh)
+    end
     return σ
 
 end
@@ -1380,7 +1382,9 @@ function do_fois_cepa(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
     # display(cepa_vec)
     # display(ref_vec)
     e_cepa_vec=[]
+    
     println(" Do CEPA: Dim = ", length(cepa_vec))
+    cepa_vec_f=deepcopy(ref_vec)
     for i in 1:R
         ref_vec_i=FermiCG.BSTstate(ref_vec,i) 
         # display(ref_vec_i)
@@ -1388,12 +1392,24 @@ function do_fois_cepa(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
         zero!(cepa_vec_i) 
         println(" Do CEPA: Dim = ", length(cepa_vec_i))
         @time e_cepa, x_cepa = tucker_cepa_solve(ref_vec_i, cepa_vec_i, cluster_ops, clustered_ham, cepa_shift, cepa_mit, tol=tol, max_iter=max_iter, verbose=verbose)
-
+        
         @printf(" E(cepa) corr =                 %12.8f\n", e_cepa[1])
         @printf(" X(cepa) norm =                 %12.8f\n", sqrt(orth_dot(x_cepa, x_cepa)[1]))
-        # nonorth_add!(x_cepa, ref_vec_i)
-        # orthonormalize!(x_cepa)
+        clustered_S2 = extract_S2( x_cepa.clusters)
+        @printf(" %-50s", "Compute <S^2>: ")
+
+        flush(stdout)
+        tmp = deepcopy( x_cepa )
+        zero!(tmp)
+        @time build_sigma!(tmp,  x_cepa , cluster_ops, clustered_S2)
+        s2 = orth_dot(tmp, x_cepa )
+        flush(stdout)
+        @printf(" %5s %12s %12s\n", "Root", "Energy", "S2") 
+        @printf("%5i %12.8f %12.8f\n", i, e_cepa[1], s2[1])
+        # nonorth_add!(cepa_vec_f, x_cepa)
+        # orthonormalize!(cepa_vec_f)
         push!(e_cepa_vec, e_cepa[1])
+
     end
     return e_cepa_vec
 end
