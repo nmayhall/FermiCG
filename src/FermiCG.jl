@@ -22,6 +22,7 @@ using ThreadPools
 using Distributed
 using JLD2
 using LinearMaps
+using Random
 
 # our packages
 using QCBase
@@ -84,6 +85,8 @@ include("tpsci.jl")
 
 include("dense_inner.jl")
 include("dense_outer.jl")
+include("spt_variance.jl")
+# include("tps_trimci.jl")
 
 #
 #####################################

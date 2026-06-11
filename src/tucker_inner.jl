@@ -114,7 +114,7 @@ function cache_hamiltonian(bra::BSTstate{T,N,R}, ket::BSTstate{T,N,R}, cluster_o
         println(length(keys_to_loop))
     end
     
-    Threads.@threads for ftrans in keys_to_loop
+    Threads.@threads :static for ftrans in keys_to_loop
         scr = scr_f[Threads.threadid()]
         terms = clustered_ham[ftrans]
         for term in terms
@@ -245,8 +245,67 @@ function build_sigma!(sigma_vector::BSTstate{T,N,R}, ci_vector::BSTstate{T,N,R},
 end
 
 
+"""
+    build_sigma_cepa!(sigma_vector, ci_vector, cluster_ops, clustered_ham)
+
+Thread-safe version of build_sigma! for use in CEPA matvec.
+Uses per-task scratch allocation to avoid races with Julia's dynamic scheduler.
+"""
+function build_sigma_cepa!(sigma_vector::BSTstate{T,N,R}, ci_vector::BSTstate{T,N,R}, cluster_ops, clustered_ham; nbody=4, cache=false, verbose=1) where {T,N,R}
+    #={{{=#
+    jobs = []
+    for (fock_bra, configs_bra) in sigma_vector
+        for (config_bra, tuck_bra) in configs_bra
+            push!(jobs, [fock_bra, config_bra])
+        end
+    end
+
+    nscr = 10
+    output_lock = ReentrantLock()
+    output = []
+
+    Threads.@threads for job in jobs
+        scr = [zeros(T, 1000) for _ in 1:nscr]   # per-task, no sharing
+
+        task_output = []
+
+        fock_bra   = job[1]
+        config_bra = job[2]
+        coeff_bra  = sigma_vector[fock_bra][config_bra]
+
+        for (fock_ket, configs_ket) in ci_vector
+            fock_trans = fock_bra - fock_ket
+            haskey(clustered_ham, fock_trans) || continue
+
+            for (config_ket, coeff_ket) in configs_ket
+                for term in clustered_ham[fock_trans]
+                    length(term.clusters) <= nbody || continue
+                    check_term(term, fock_bra, config_bra, fock_ket, config_ket) || continue
+
+                    out = form_sigma_block!(term, cluster_ops, fock_bra, config_bra,
+                                           fock_ket, config_ket,
+                                           coeff_bra, coeff_ket,
+                                           scr, cache=cache)
+                    push!(task_output, (fock_bra, config_bra, out))
+                end
+            end
+        end
+
+        lock(output_lock) do
+            push!(output, task_output...)
+        end
+    end
+
+    for out in output
+        add!(sigma_vector[out[1]][out[2]].core, out[3])
+    end
+    return
+    #=}}}=#
+end
+
+
 #
-# form_sigma_block computes the action of the term on a Tucker compressed state, 
+# form_sigma_block computes the action of the term on a Tucker compressed state,
 # projected into the space defined by bra. This is used to work with H within a subspace defined by a compression
 #
 #

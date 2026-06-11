@@ -1153,10 +1153,8 @@ function _pt2_job2(sig_fock, job, ket::BSTstate{T,N,R}, cluster_ops, clustered_h
             end
         end
     end
-    curr_tuck = Vector{Any}()
     for (sig_tconfig, terms_to_process) in tconfigs_to_process
-        #curr_tuck=Tucker{T,N,R}() #initialization problem is there as in every iteration there is a new dimension of Tucker core and factor 
-        #if I don't want to store tucker in a list, though it is not affecting the time and memory allocations
+        curr_tuck = Vector{Any}()    # reset per sig_tconfig: Tucker dims vary between blocks
         for (term, ket_fock, ket_tconfig) in terms_to_process
             ket_tuck = ket[ket_fock][ket_tconfig]
             check_term(term, sig_fock, sig_tconfig, ket_fock, ket_tconfig) || continue
@@ -1213,5 +1211,338 @@ function _pt2_job2(sig_fock, job, ket::BSTstate{T,N,R}, cluster_ops, clustered_h
     end
 
 
-    return ecorr 
+    return ecorr
+end
+
+
+# =============================================================================
+# NEW PT2: block-by-block processing with Tucker rotation
+#
+# Key ideas vs _pt2_job / _pt2_job2:
+#
+#   1. Metadata-only Phase 1: groups (term, ket_fock, ket_tconfig) by sig_tconfig
+#      without storing any Tucker data (same as _pt2_job2 Phase 1).
+#
+#   2. Collect-then-add Phase 2: for each sig_tconfig, calls form_sigma_block_expand
+#      once per contributing (term, ket_fock, ket_tconfig), collects into a Vector,
+#      then calls nonorth_add ONCE — no O(K²) iterative SVD merging.
+#
+#   3. Tucker rotation: after building curr_tuck_H (= <X|H|0> in original Tucker
+#      basis), computes the pseudo-canonical rotation V by diagonalising the
+#      projected Fock matrix F_proj = U' * F_cluster * U for each cluster.
+#      Rotates the core tensors via transform_basis(core, V_rot) — equivalent to
+#      what build_sigma!(σ_canonical, ψ0, H) would return, but WITHOUT an
+#      additional full sweep over all reference blocks and H terms.
+#      Eliminates one build_sigma!(H) call per sig_tconfig.
+#
+#   4. Lightweight F0: creates a minimal single-block BSTstate with canonical
+#      Tucker factors (zero cores) and calls build_sigma! with clustered_ham_0
+#      (1-body only, N terms instead of all H terms).
+#
+#   5. Inline ecorr: computes E² contribution without materialising ψ₁.
+#
+# Memory vs _pt2_job: never holds the full FOIS BSTstate; peak per thread ≈
+#   metadata + one Tucker block at a time (instead of 4-6× full FOIS).
+# Speed vs _pt2_job2: replaces K_sig × build_sigma!(H) with K_sig × cheap F0.
+# =============================================================================
+
+"""
+    _pt2_job_blockwise(sig_fock, job, ket, cluster_ops, clustered_ham, clustered_ham_0,
+                       nbody, thresh, max_number, E0, F0, prescreen, H0) -> ecorr
+
+Compute the PT2 energy correction for one Fock sector using the Tucker-rotation
+approach. See module comment above for algorithm details.
+"""
+function _pt2_job_blockwise(sig_fock, job, ket::BSTstate{T,N,R}, cluster_ops,
+                        clustered_ham, clustered_ham_0::ClusteredOperator{N},
+                        nbody, thresh, max_number, E0::Vector{T}, F0::Vector{T},
+                        prescreen::Bool, H0::String) where {T,N,R}
+
+    # ------------------------------------------------------------------
+    # Phase 1: group (term, ket_fock, ket_tconfig) metadata by sig_tconfig.
+    # No Tucker data stored — just lightweight tuples.
+    # ------------------------------------------------------------------
+    tconfigs_to_process = Dict{TuckerConfig{N}, Vector{Vector{Any}}}()
+
+    for jobi in job
+        terms, ket_fock, ket_tconfigs = jobi
+        for term in terms
+            length(term.clusters) <= nbody || continue
+            for (ket_tconfig, _) in ket_tconfigs
+                available = []
+                for ci in term.clusters
+                    tmp = []
+                    haskey(ket.p_spaces[ci.idx], sig_fock[ci.idx]) &&
+                        push!(tmp, ket.p_spaces[ci.idx][sig_fock[ci.idx]])
+                    haskey(ket.q_spaces[ci.idx], sig_fock[ci.idx]) &&
+                        push!(tmp, ket.q_spaces[ci.idx][sig_fock[ci.idx]])
+                    push!(available, tmp)
+                end
+                for prod in Iterators.product(available...)
+                    sig_tconfig_arr = [ket_tconfig.config...]
+                    for cidx in 1:length(term.clusters)
+                        ci = term.clusters[cidx]
+                        sig_tconfig_arr[ci.idx] = prod[cidx]
+                    end
+                    sig_tconfig = TuckerConfig(sig_tconfig_arr)
+                    entry = [term, ket_fock, ket_tconfig]
+                    if haskey(tconfigs_to_process, sig_tconfig)
+                        push!(tconfigs_to_process[sig_tconfig], entry)
+                    else
+                        tconfigs_to_process[sig_tconfig] = [entry]
+                    end
+                end
+            end
+        end
+    end
+
+    # ------------------------------------------------------------------
+    # Phase 2: per sig_tconfig — build H Tucker, rotate, compute ecorr
+    # ------------------------------------------------------------------
+    ecorr    = zeros(T, R)
+    clusters = ket.clusters
+
+    for (sig_tconfig, contributions) in tconfigs_to_process
+
+        # -- 2a. Call form_sigma_block_expand for each contribution; collect Tucker blocks --
+        tucks_H = Tucker{T,N,R}[]
+        for entry in contributions
+            term, ket_fock, ket_tconfig = entry[1], entry[2], entry[3]
+            ket_tuck = ket[ket_fock][ket_tconfig]
+
+            check_term(term, sig_fock, sig_tconfig, ket_fock, ket_tconfig) || continue
+
+            if prescreen
+                bound = calc_bound(term, cluster_ops,
+                                   sig_fock, sig_tconfig,
+                                   ket_fock, ket_tconfig, ket_tuck,
+                                   prescreen=thresh)
+                bound == true || continue
+            end
+
+            sig_tuck = form_sigma_block_expand(term, cluster_ops,
+                                               sig_fock, sig_tconfig,
+                                               ket_fock, ket_tconfig, ket_tuck,
+                                               max_number=max_number,
+                                               prescreen=thresh)
+            length(sig_tuck) == 0 && continue
+            norm(sig_tuck)   <  thresh && continue
+
+            push!(tucks_H, sig_tuck)
+        end
+
+        isempty(tucks_H) && continue
+
+        # -- 2b. Combine H Tucker blocks (collect-then-add — no iterative SVD).
+        #        No compression here: compressing <X|H|0> before the Tucker rotation
+        #        introduces truncation error in H that the reference (build_sigma!) avoids.
+        curr_tuck_H = length(tucks_H) == 1 ? only(tucks_H) : nonorth_add(tucks_H)
+        norm(curr_tuck_H) < thresh && continue
+
+        # -- 2c. Pseudo-canonical rotations V: diagonalise U'*F*U for each cluster.
+        #        V_rot[ci.idx] is the ki×ki orthogonal rotation matrix.
+        #        Fdiag_core[i1,...,iN] = Σ_ci λ_ci[i_ci]  (sum of cluster eigenvalues)
+        core_dims  = size(curr_tuck_H.core[1])
+        V_rot      = Vector{Matrix{T}}(undef, N)
+        Fdiag_core = zeros(T, core_dims)
+
+        for ci in clusters
+            Ui = curr_tuck_H.factors[ci.idx]
+            ki = size(Ui, 2)
+            F_ci   = cluster_ops[ci.idx][H0][(sig_fock[ci.idx], sig_fock[ci.idx])][sig_tconfig[ci.idx], sig_tconfig[ci.idx]]
+            F_proj = Ui' * F_ci * Ui
+
+            if ki > 1
+                eig_res       = eigen(Symmetric(F_proj))
+                V_rot[ci.idx] = eig_res.vectors
+                λ_shape = ntuple(d -> d == ci.idx ? ki : 1, N)
+                Fdiag_core .+= reshape(eig_res.values, λ_shape...)
+            else
+                V_rot[ci.idx] = ones(T, 1, 1)
+                Fdiag_core   .+= F_proj[1, 1]
+            end
+        end
+
+        # -- 2d. Tucker rotation: rotate H cores into canonical basis.
+        #        transform_basis(core, V_rot) applies rotations along each cluster
+        #        dimension — equivalent to build_sigma!(σ_canon, ψ0, H) by linearity.
+        H_cores_rot = ntuple(r -> transform_basis(curr_tuck_H.core[r], V_rot), R)
+
+        # -- 2e. Minimal single-block BSTstate with canonical Tucker factors (zero cores)
+        #        for F0 and overlap Sx computation.
+        U_canon    = ntuple(i -> curr_tuck_H.factors[i] * V_rot[i], N)
+        core_zeros = ntuple(_ -> zeros(T, core_dims), R)
+
+        sig_f0 = BSTstate(ket.clusters, ket.p_spaces, ket.q_spaces, T=T, R=R)
+        add_fockconfig!(sig_f0, sig_fock)
+        sig_f0[sig_fock][sig_tconfig] = Tucker{T,N,R}(core_zeros, U_canon)
+
+        # -- 2f. Overlap Sx = <ψ0 | X_canonical> (computed before filling F0 cores) --
+        Sx = project_into_new_basis(ket, sig_f0)
+
+        # -- 2g. F0 in canonical basis — only 1-body operator, cheap --
+        build_sigma!(sig_f0, ket, cluster_ops, clustered_ham_0)
+
+        # -- 2h. Compute ecorr inline (no ψ₁ materialisation, no deepcopy) --
+        #        ecorr[r] += Σ_i  num[r,i]² / (F0[r] − Fdiag_core[i] + ε)
+        #        num[r,i] = H[r,i] − F0[r,i] − (E0[r]−F0[r])·Sx[r,i]
+        Fv    = vec(Fdiag_core)
+        nFOIS = length(Fv)
+
+        # Read Sx cores (may be zero if ψ0 doesn't overlap with sig_f0)
+        has_Sx = haskey(Sx, sig_fock) && haskey(Sx[sig_fock], sig_tconfig)
+        F0_block = sig_f0[sig_fock][sig_tconfig]
+        Sx_block = has_Sx ? Sx[sig_fock][sig_tconfig] : nothing
+
+        for r in 1:R
+            H_r  = vec(H_cores_rot[r])
+            F0_r = vec(F0_block.core[r])
+            Sx_r = has_Sx ? vec(Sx_block.core[r]) : nothing
+
+            e_corr_r = zero(T)
+            dE       = E0[r] - F0[r]
+            @inbounds for i in 1:nFOIS
+                sx_i  = has_Sx ? Sx_r[i] : zero(T)
+                num_i = H_r[i] - F0_r[i] - dE * sx_i
+                e_corr_r += num_i * num_i / (F0[r] - Fv[i] + 1e-12)
+            end
+            ecorr[r] += e_corr_r
+        end
+    end
+
+    return ecorr
+end
+
+
+"""
+    compute_pt2_energy_blockwise(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+                                  H0="Hcmf", nbody=4, thresh_foi=1e-6,
+                                  max_number=nothing, opt_ref=true, ci_tol=1e-6,
+                                  verbose=1, prescreen=false) -> E2
+
+Compute PT2 energy using the block-by-block Tucker-rotation approach
+(`_pt2_job_blockwise`). Numerically equivalent to `compute_pt2_energy` /
+`compute_pt2_energy2` but with lower peak memory (no full FOIS BSTstate per
+thread) and faster for many-block Fock sectors (no redundant build_sigma!(H)
+per FOIS block).
+"""
+function compute_pt2_energy_blockwise(ref::BSTstate{T,N,R}, cluster_ops, clustered_ham;
+                                  H0         = "Hcmf",
+                                  nbody      = 4,
+                                  thresh_foi = 1e-6,
+                                  max_number = nothing,
+                                  opt_ref    = true,
+                                  ci_tol     = 1e-6,
+                                  verbose    = 1,
+                                  prescreen  = false) where {T,N,R}
+    println()
+    println(" |...................................BST-PT2 (fast).......................................")
+    verbose < 1 || println(" H0          : ", H0        )
+    verbose < 1 || println(" nbody       : ", nbody     )
+    verbose < 1 || println(" thresh_foi  : ", thresh_foi)
+    verbose < 1 || println(" max_number  : ", max_number)
+    verbose < 1 || println(" opt_ref     : ", opt_ref   )
+    verbose < 1 || println(" ci_tol      : ", ci_tol    )
+    verbose < 1 || println(" verbose     : ", verbose   )
+    verbose < 1 || @printf("\n")
+    verbose < 1 || @printf(" %-50s%10i\n", "Length of Reference: ", length(ref))
+
+    lk = ReentrantLock()
+
+    # Optionally re-solve / compute reference energy
+    ref_vec = deepcopy(ref)
+    E0 = zeros(T, R)
+    if opt_ref
+        @printf(" %-50s\n", "Solve zeroth-order problem: ")
+        time_ci = @elapsed E0, ref_vec = ci_solve(ref_vec, cluster_ops, clustered_ham, conv_thresh=ci_tol)
+        @printf(" %-50s%10.6f seconds\n", "Diagonalization time: ", time_ci)
+    else
+        @printf(" %-50s", "Compute zeroth-order energy: ")
+        flush(stdout)
+        @time E0 = compute_expectation_value(ref_vec, cluster_ops, clustered_ham)
+    end
+
+    # Extract 1-body zeroth-order Hamiltonian
+    clustered_ham_0 = extract_1body_operator(clustered_ham, op_string=H0)
+    @printf(" %-50s", "Compute <0|H0|0>: ")
+    @time F0 = compute_expectation_value(ref_vec, cluster_ops, clustered_ham_0)
+
+    if verbose > 0
+        @printf(" %5s %12s %12s\n", "Root", "<0|H|0>", "<0|F|0>")
+        for r in 1:R
+            @printf(" %5s %12.8f %12.8f\n", r, E0[r], F0[r])
+        end
+    end
+
+    # Build job list (identical logic to compute_pt2_energy)
+    clusters = ref_vec.clusters
+    jobs = Dict{FockConfig{N}, Vector{Tuple}}()
+    for (fock_ket, configs_ket) in ref_vec.data
+        for (ftrans, terms) in clustered_ham
+            fock_x = ftrans + fock_ket
+            all(f[1] >= 0 for f in fock_x) || continue
+            all(f[2] >= 0 for f in fock_x) || continue
+            all(f[1] <= length(clusters[fi]) for (fi, f) in enumerate(fock_x)) || continue
+            all(f[2] <= length(clusters[fi]) for (fi, f) in enumerate(fock_x)) || continue
+            job_input = (terms, fock_ket, configs_ket)
+            if haskey(jobs, fock_x)
+                push!(jobs[fock_x], job_input)
+            else
+                jobs[fock_x] = [job_input]
+            end
+        end
+    end
+
+    jobs_vec = collect(pairs(jobs))
+    println(" Number of jobs:    ", length(jobs_vec))
+    println(" Number of threads: ", Threads.nthreads())
+    BLAS.set_num_threads(1)
+    flush(stdout)
+
+    e2_thread = [zeros(T, R) for _ in 1:Threads.nthreads()]
+
+    tmp = max(1, Int(round(length(jobs_vec) / 100)))
+    verbose < 2 || println(" |----------------------------------------------------------------------------------------------------|")
+    verbose < 2 || println(" |0%                                                                                              100%|")
+    verbose < 2 || print(" |")
+
+    nprinted = 0
+    alloc = @allocated t = @elapsed begin
+        @Threads.threads for (jobi, (fock_sig, job)) in collect(enumerate(jobs_vec))
+            tid = Threads.threadid()
+            e2_thread[tid] .+= _pt2_job_blockwise(fock_sig, job, ref_vec,
+                                               cluster_ops, clustered_ham,
+                                               clustered_ham_0,
+                                               nbody, thresh_foi, max_number,
+                                               E0, F0, prescreen, H0)
+            if verbose > 1 && jobi % tmp == 0
+                lock(lk)
+                try
+                    print("-"); nprinted += 1; flush(stdout)
+                finally
+                    unlock(lk)
+                end
+            end
+        end
+    end
+    flush(stdout)
+    verbose < 2 || for _ in nprinted+1:100; print("-"); end
+    verbose < 2 || println("|")
+    flush(stdout)
+
+    @printf(" %-48s%10.1f s Allocated: %10.1e GB\n", "Time spent computing E2: ", t, alloc*1e-9)
+    ecorr = sum(e2_thread)
+
+    E2 = zeros(R)
+    for r in 1:R
+        E2[r] = E0[r] + ecorr[r]
+        @printf(" State %3i: %-35s%14.8f\n", r, "E(PT2) corr: ", ecorr[r])
+    end
+    @printf(" %5s %12s %12s\n", "Root", "E(0)", "E(2)")
+    for r in 1:R
+        @printf(" %5s %12.8f %12.8f\n", r, E0[r], E2[r])
+    end
+    println(" ......................................................................................|")
+
+    return E2
 end
